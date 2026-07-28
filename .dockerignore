@@ -1,0 +1,18 @@
+# Keep the meshcore-repeater build context small - without this, `docker build`
+# would tar up the whole repo, including the 250MB+ SD-card images and every
+# unrelated MeshCore board variant/doc.
+.git
+sd-image/
+
+meshcore/.git
+meshcore/.github
+meshcore/.devcontainer
+meshcore/.vscode
+meshcore/arch
+meshcore/bin
+meshcore/boards
+meshcore/docs
+meshcore/logo
+meshcore/test
+meshcore/variants/*
+!meshcore/variants/linux_udp_bridge

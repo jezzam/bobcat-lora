@@ -1,0 +1,18 @@
+services:
+  meshcore-repeater:
+    build:
+      context: ..
+      dockerfile: meshcore-deploy/Dockerfile
+    image: meshcore-repeater
+    container_name: meshcore-repeater
+    # lora_pkt_fwd_1302's config (global_conf_1302.json) points at literal
+    # 127.0.0.1:1680 - a container's loopback is its own network-namespace-
+    # local loopback, unreachable from the host's 127.0.0.1 without host
+    # networking (a hard namespace boundary, not a Docker-Desktop-style gap).
+    # No --privileged needed: this container touches no device nodes/GPIO at
+    # all, it's a pure UDP socket - narrower than the stock miner container's
+    # --privileged --network host --device /dev/i2c-1 pattern.
+    network_mode: host
+    volumes:
+      - /update/meshcore-data:/data
+    restart: unless-stopped

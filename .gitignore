@@ -1,0 +1,7 @@
+# SD card images are large binaries (~124-130MB each) — GitHub hard-rejects
+# files over 100MB via normal git push (no LFS configured here). Keep them
+# on disk (see sd-image/README.md for provenance/checksums) but don't track
+# them in git unless you set up Git LFS.
+sd-image/original/*.img.xz
+sd-image/patched/*.img.xz
+sd-image/**/*.img
