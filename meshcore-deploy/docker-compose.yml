@@ -16,3 +16,15 @@ services:
     volumes:
       - /update/meshcore-data:/data
     restart: unless-stopped
+    environment:
+      # Overrides the compile-time defaults (currently the Brisbane/SEQ
+      # MeshCore preset - wiki.mbug.com.au/en/Meshcore/Settings) without a
+      # rebuild. MUST match global_conf_1302.json's actual radio_0/
+      # chan_Lora_std tuning on the host - this container has no way to read
+      # or verify that file, so keeping the two in sync is a manual step.
+      # CR in particular is explicitly meant to be tuned down as the local
+      # mesh gains more direct neighbours - see Research_beginning_notes.md.
+      MESHCORE_LORA_FREQ: "923.125"
+      MESHCORE_LORA_BW: "62.5"
+      MESHCORE_LORA_SF: "8"
+      MESHCORE_LORA_CR: "6"

@@ -276,7 +276,43 @@ One real infrastructure issue found and fixed: `docker build`'s default bridge n
 
 **Confirmed working end-to-end against the real hardware**: container starts, binds `127.0.0.1:1680`, generates and persists a real Ed25519 identity to `/update/meshcore-data` (bind-mounted, survives container restarts), runs stably with no crashes. Verified via `/proc/net/udp` (cross-referenced against `/proc/1000/fd/` — PID 1000 is the real `lora_pkt_fwd_1302`) that **the real packet-forwarder process has two live connected UDP sockets talking to our container's port 1680** — genuine two-way protocol traffic with the actual concentrator hardware path, not a simulation.
 
-**What's still unverified**: actual over-the-air RF reception/transmission (would need a second physical LoRa device nearby tuned to 904.6MHz/SF8/500kHz to confirm) and real mesh routing behavior with another MeshCore node. The `miner` container remains stopped as before; `lora_pkt_fwd_1302` remains running exactly as-is, untouched.
+**What's still unverified**: actual over-the-air RF reception/transmission and real mesh routing behavior with another MeshCore node. The `miner` container remains stopped as before.
+
+### Retuned to the real local MeshCore channel — Brisbane/SEQ default (2026-07-28)
+User is in Brisbane/SEQ, with existing MeshCore repeaters nearby — real over-the-air testing is possible once channel-matched (MeshCore requires exact frequency/BW/SF agreement; being in range doesn't help otherwise). Researched Australian MeshCore presets (web search + the user pasting the actual Brisbane/SEQ community page content, since automated fetching of that page failed):
+
+| Preset | Frequency | BW | SF | CR | Where |
+|---|---|---|---|---|---|
+| Australia (Mid) | 915.075 MHz | 125 kHz | 9 | 4/5 | Greater Sydney |
+| Australia (Narrow) | 916.575 MHz | 62.5 kHz | 7 | 4/8 | EastMesh default, regional NSW/ACT |
+| Australia (Wide) | 915.800 MHz | 250 kHz | 11 | 4/5 | Other states (per a GitHub issue correcting this preset's SF) |
+| **Brisbane/SEQ (in use)** | **923.125 MHz** | **62.5 kHz** | **8** | **4/6** | wiki.mbug.com.au/en/Meshcore/Settings — **this is what we configured** |
+
+Confirmed: these presets are **mutually exclusive** — devices must match exactly to talk directly to each other. CR is explicitly a recommendation, not fixed — intended to be lowered as the local mesh gains more direct neighbours.
+
+**Made runtime-configurable** (user's call, and a good one): `LORA_FREQ/BW/SF/CR` CMake `-D` flags are now just fallback defaults; `PktFwdRadio::begin()` reads `MESHCORE_LORA_FREQ/BW/SF/CR` env vars at startup and overrides them, so switching presets or tuning CR down later doesn't need a rebuild — just restart the container with different `docker-compose.yml` environment values.
+
+### Major discovery: `global_conf_1302.json` is NOT persistently editable directly
+First attempt: edited `/update/cfg/global_conf_1302.json` directly (retuned `radio_0` to 923.125MHz, `chan_Lora_std` to 62.5kHz/SF8, disabled the now-irrelevant multi-SF channels), rebooted to test persistence. **The edit was completely gone after reboot** — the file came back byte-for-byte identical to our pre-edit backup.
+
+Root cause, found by reading the actual boot scripts (`/etc/init.d/lora-sx1302.sh` → `/usr/local/bin/easylinkin_lora_cfg_update_1302.sh` → `/etc/lora_cfg_check_1302.sh`):
+- `easylinkin_lora_cfg_update_1302.sh`'s `update_web_conf()` runs **unconditionally on every boot** and always does `cp /etc/lora_config/global_conf_sx1250_${CONF}.json → /update/cfg/global_conf_1302.json`, where `${CONF}` comes from UCI (`uci get lora.@rsconf[0].radio_conf`, config file `/etc/config/lora`) — **stock value was `us915`**, so every boot silently restamped the stock US915 template over any edit, then regenerated `gateway_ID` deterministically from the Ethernet MAC (explaining why the "reverted" file matched our backup exactly — same template + same deterministic MAC-derived ID, every time).
+- Separately, `/etc/lora_cfg_check_1302.sh` validates the file by stripping comments with a **single-line-only** sed (`s/\/\*.*\*\///`) then `python json.loads()` — our first edit used multi-line `/* */` comments, which would have failed this validation too (triggering its own separate repair-from-`cn470`-template fallback), independent of the UCI issue above.
+
+**Fix**: `easylinkin_lora_cfg_update_1302.sh` has a `set_costumize_freq_conf()` function, only invoked when `radio_conf` contains `"customize"`, that reads frequency/channel-offset overrides straight from UCI — clearly the vendor's intended customization path. Set `uci set lora.@rsconf[0].radio_conf='customize'; uci commit lora`. No `global_conf_sx1250_customize.json` template actually exists on this device, so the unconditional `cp` now fails harmlessly (source missing, destination untouched) rather than clobbering our edit — confirmed by dry-running both boot scripts manually (`md5sum` of the config file identical before and after both scripts ran). Re-applied the config edit with single-line comments only. **Verified surviving an actual reboot this time** — `lora_pkt_fwd_1302`'s own startup log confirms `radio 0 ... center frequency 923125000` and `Lora std channel> radio 0, IF 0 Hz, 62500 Hz bw, SF 8`.
+
+Backup of the original stock config preserved at `/update/cfg/global_conf_1302.json.bak-pre-meshcore` on the device (not committed to this repo).
+
+### Known-benign oddity: `lora_pkt_fwd_1302` runs as two processes
+Every manual restart (three separate attempts, including via the proper `/etc/init.d/lora-sx1302.sh start`) produces **two** `lora_pkt_fwd_1302` processes, both with `/dev/spidev1.0` open, both consuming similar CPU. Investigated for a real SPI-contention bug (checked `dmesg` for errors, compared fds, checked parent PIDs) — found no evidence of actual harm: no kernel/SPI errors ever logged, the daemon's own stats show clean `PUSH_DATA`/`PULL_DATA` exchange with 100% ack rate, and the pattern is perfectly consistent across every restart, suggesting it's just an intrinsic (if unexplained) trait of this binary's process model rather than something our restarts are causing. Not investigated further given no observed functional impact — worth keeping an eye on if anything RF-related seems flaky later.
+
+### Restart procedure reference (for next time)
+Don't manually `nohup`/`setsid` the binary directly — use the real init script, which correctly threads through the UCI config check and validation steps:
+```
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin /etc/init.d/lora-sx1302.sh stop
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin /etc/init.d/lora-sx1302.sh start
+```
+Note: `start` backgrounds the daemon with **no output redirection**, so it'll stream its live stats block forever into your SSH session if left in the foreground — always run with `< /dev/null` and either accept a short pause or expect to background/detach your own SSH call, or you'll hit your own tool's timeout waiting for a pipe that never closes.
 
 ---
 
