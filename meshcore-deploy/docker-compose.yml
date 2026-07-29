@@ -16,15 +16,23 @@ services:
     volumes:
       - /update/meshcore-data:/data
     restart: unless-stopped
+    # Keeps stdin open so `docker attach` can drive the admin CLI (docs/
+    # cli_commands.md - neighbors, stats-packets, stats-radio, etc.),
+    # matching a real device's USB-serial console. Without this, the
+    # container's Serial-over-stdin shim (compat/Arduino.h) sees stdin as
+    # closed/EOF immediately and `docker attach` has nothing to write into.
+    stdin_open: true
     environment:
       # Overrides the compile-time defaults (currently the Brisbane/SEQ
       # MeshCore preset - wiki.mbug.com.au/en/Meshcore/Settings) without a
-      # rebuild. MUST match global_conf_1302.json's actual radio_0/
+      # rebuild. FREQ/BW/SF MUST match global_conf_1302.json's actual radio_0/
       # chan_Lora_std tuning on the host - this container has no way to read
       # or verify that file, so keeping the two in sync is a manual step.
-      # CR in particular is explicitly meant to be tuned down as the local
-      # mesh gains more direct neighbours - see Research_beginning_notes.md.
+      # CR is TX-side only (conveyed per-packet in the explicit LoRa header,
+      # not a concentrator setting) - confirmed against the actual nearby
+      # repeater's live app settings (screenshot, 2026-07-28): CR 4/5, not
+      # the 4/6 the wiki text suggested - see Research_beginning_notes.md.
       MESHCORE_LORA_FREQ: "923.125"
       MESHCORE_LORA_BW: "62.5"
       MESHCORE_LORA_SF: "8"
-      MESHCORE_LORA_CR: "6"
+      MESHCORE_LORA_CR: "5"

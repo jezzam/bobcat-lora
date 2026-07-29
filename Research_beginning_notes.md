@@ -286,7 +286,9 @@ User is in Brisbane/SEQ, with existing MeshCore repeaters nearby — real over-t
 | Australia (Mid) | 915.075 MHz | 125 kHz | 9 | 4/5 | Greater Sydney |
 | Australia (Narrow) | 916.575 MHz | 62.5 kHz | 7 | 4/8 | EastMesh default, regional NSW/ACT |
 | Australia (Wide) | 915.800 MHz | 250 kHz | 11 | 4/5 | Other states (per a GitHub issue correcting this preset's SF) |
-| **Brisbane/SEQ (in use)** | **923.125 MHz** | **62.5 kHz** | **8** | **4/6** | wiki.mbug.com.au/en/Meshcore/Settings — **this is what we configured** |
+| **Brisbane/SEQ (in use)** | **923.125 MHz** | **62.5 kHz** | **8** | **4/5** | wiki.mbug.com.au/en/Meshcore/Settings + confirmed against the actual nearby repeater's live app settings |
+
+**CR correction (2026-07-28):** the wiki text said CR 4/6, but a screenshot of the actual nearby repeater's "Use Radio Settings" confirmation dialog (from the MeshCore map/app) shows **CR 4/5**, not 4/6 — matches the wiki's own caveat that CR is "just a recommendation" and some presets use 5. Corrected `MESHCORE_LORA_CR` to `5` in `docker-compose.yml` and the CMake default. Freq/BW/SF were already correct (confirmed by the same screenshot). No concentrator retune needed for this fix — CR is TX-side only, conveyed per-packet in the explicit LoRa header (confirmed via the concentrator's own log: `Explicit header`), not a `global_conf_1302.json` channel setting, so a container recreation with the new env var was sufficient.
 
 Confirmed: these presets are **mutually exclusive** — devices must match exactly to talk directly to each other. CR is explicitly a recommendation, not fixed — intended to be lowered as the local mesh gains more direct neighbours.
 
@@ -303,8 +305,10 @@ Root cause, found by reading the actual boot scripts (`/etc/init.d/lora-sx1302.s
 
 Backup of the original stock config preserved at `/update/cfg/global_conf_1302.json.bak-pre-meshcore` on the device (not committed to this repo).
 
-### Known-benign oddity: `lora_pkt_fwd_1302` runs as two processes
-Every manual restart (three separate attempts, including via the proper `/etc/init.d/lora-sx1302.sh start`) produces **two** `lora_pkt_fwd_1302` processes, both with `/dev/spidev1.0` open, both consuming similar CPU. Investigated for a real SPI-contention bug (checked `dmesg` for errors, compared fds, checked parent PIDs) — found no evidence of actual harm: no kernel/SPI errors ever logged, the daemon's own stats show clean `PUSH_DATA`/`PULL_DATA` exchange with 100% ack rate, and the pattern is perfectly consistent across every restart, suggesting it's just an intrinsic (if unexplained) trait of this binary's process model rather than something our restarts are causing. Not investigated further given no observed functional impact — worth keeping an eye on if anything RF-related seems flaky later.
+### Known-benign oddity: `lora_pkt_fwd_1302` runs as two processes — and something auto-respawns it
+Every manual restart produces **two** `lora_pkt_fwd_1302` processes, both with `/dev/spidev1.0` open, both consuming similar CPU. No SPI/kernel errors ever logged, clean `PUSH_DATA`/`PULL_DATA` exchange with 100% ack rate — no evidence of actual harm.
+
+**Update**: also confirmed **something automatically respawns the process within seconds of it being killed**, with a fresh PID each time (observed across `kill`, `kill -9`, and `pkill -f` attempts, checked via `pgrep`/`ps -o lstart` immediately after each kill). Checked `/etc/inittab` (no `respawn` entry for it — only the debug-UART getty and console tty are respawn-managed) and cron (`crontab -l`, `/etc/crontabs/`, `/var/spool/cron/crontabs/` — all empty). Likely culprit: `/usr/bin/mpm -d` (a generic-sounding "module/process manager" daemon, running since near boot) or `ota_daemon_new` (seen restarting itself around the same time as one respawn) — **not conclusively identified**, not worth the further time given it's not causing harm. Practical implication: **don't try to precisely track or log a specific `lora_pkt_fwd_1302` PID or manually-redirected log file** — whatever you set up will likely go stale within seconds as the supervisor swaps in a fresh, unlogged instance. Verify behavior through the MeshCore container's own CLI stats instead (`stats-radio`/`neighbors`/`stats-packets` via `/proc/<container-pid>/fd/0`, see below) since that reflects whatever's actually running via the stable UDP port, independent of which forwarder PID is currently alive.
 
 ### Restart procedure reference (for next time)
 Don't manually `nohup`/`setsid` the binary directly — use the real init script, which correctly threads through the UCI config check and validation steps:
@@ -313,6 +317,132 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin /etc/init.d/lora-sx1302.sh sto
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin /etc/init.d/lora-sx1302.sh start
 ```
 Note: `start` backgrounds the daemon with **no output redirection**, so it'll stream its live stats block forever into your SSH session if left in the foreground — always run with `< /dev/null` and either accept a short pause or expect to background/detach your own SSH call, or you'll hit your own tool's timeout waiting for a pipe that never closes.
+
+### Live CLI access to the running container (for debugging/monitoring)
+`docker attach` hung indefinitely every time it was tried over non-interactive SSH (even after recreating the container with `stdin_open: true` / `-i`, which was a real prerequisite but not sufficient on its own) — never fully root-caused, abandoned in favor of a more reliable technique: **write directly to the container process's stdin file descriptor via the host's procfs**, bypassing `docker attach`'s pty/protocol negotiation entirely:
+```bash
+PID=$(docker inspect --format '{{.State.Pid}}' meshcore-repeater)
+printf 'stats-packets\r\n' > /proc/$PID/fd/0   # command must end in \r (matches examples/simple_repeater/main.cpp's line parser)
+docker logs meshcore-repeater 2>&1 | tail -5    # reply appears here, since Serial output goes to the same stdout docker logs reads
+```
+Useful commands (docs/cli_commands.md): `stats-packets`, `stats-radio`, `neighbors`, `discover.neighbors` (active zero-hop probe, faster than waiting for a passive advert).
+
+### Sync word mismatch found — likely root cause of "packets received but nothing decoded"
+Once genuinely tuned to the correct local channel, the concentrator DID start detecting RF energy (`RF packets received by concentrator: 2`, then `6`) — but `CRC_FAIL`/`CRC_OK` stayed at 0% while `NO_CRC` hit 100%, and `RF packets forwarded` stayed 0 (matches `forward_crc_disabled: false` in the gateway config — no-CRC packets are deliberately not forwarded). The MeshCore container's own `recv` counter stayed 0 throughout.
+
+Root cause: `global_conf_1302.json`'s top-level `"lorawan_public": true` was never touched by the earlier channel retune — this field controls the **LoRa sync word** (public LoRaWAN 0x34 vs private 0x12), not just a naming convention. Checked every board variant in the MeshCore codebase (`grep -rn "SYNC_WORD_PRIVATE" variants/*/target.cpp`) — **every single one uses the private sync word**, no exceptions. With `lorawan_public: true`, our concentrator was listening with the wrong sync word for MeshCore traffic — explains both why nothing genuine was ever forwarded, and why the 2 detected "packets" showed as`NO_CRC` garbage (partial/spurious demodulator locks, not real decoded packets).
+
+**Fix applied**: `lorawan_public` → `false` in `global_conf_1302.json` (same edit-plus-validate procedure as the frequency retune; UCI `radio_conf=customize` already in place so this persists the same way). Sync word is a concentrator-level (RX) setting, unlike CR which is TX-side/per-packet — this required actually updating the file and restarting the forwarder process, not just a container-side env var.
+
+**Verification of this specific fix got tangled up with the auto-respawn discovery above** — by the time a clean single-process restart was confirmed, several respawns had already happened in between, some via stale manually-redirected log paths that no longer reflected the actual running process. The config file on disk is confirmed correct (`grep lorawan_public` → `false`); trusting that any respawned instance reads it correctly at its own startup (simple file read, no caching concern). **Reception outcome after this fix: not yet confirmed** — switched to polling the container's own `stats-packets` (`"recv"` field) every 20s as the monitoring approach going forward, more robust than log-tailing given the respawn churn.
+
+### CR correction (2026-07-28, cont.) — confirmed via live app screenshot
+See the region/frequency section above — the nearby Brisbane repeater's actual live "Use Radio Settings" confirmation (screenshot from the MeshCore app/map) confirmed CR 4/5, not the wiki text's 4/6. Freq/BW/SF matched exactly. Corrected `MESHCORE_LORA_CR` to `5`.
+
+### Critical bug found: our own transmissions were on the wrong frequency the entire time (2026-07-28/29)
+After 8+ hours of zero reception even with the sync-word fix applied, checked `get radio` via the CLI — it reported `904.5999755,500,8,5`, **not** our configured 923.125/62.5/8/5. This is a real bug in how `PktFwdRadio`'s env-var-driven channel params interact with MeshCore's own preferences system, not a device-config issue like the earlier two:
+
+- `examples/simple_repeater/MyMesh.cpp:875-888` sets `_prefs.freq/bw/sf/cr` from the compile-time `LORA_*` macros on construction.
+- `MyMesh::begin()` (line 931) then calls `_cli.loadPrefs(_fs)`, which **loads persisted preferences from the bind-mounted `/data` volume** — overwriting the freshly-set compile-time defaults with whatever was saved from a *previous* run.
+- Line 962 then calls `radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr)` — pushing whatever `_prefs` now holds (the **stale persisted value**, from our very first container run months... well, hours earlier, back when the compile-time default was still the old 904.6MHz placeholder) into `PktFwdRadio`, **overwriting our correct env-var-initialized values**.
+
+Net effect: our own outgoing transmissions (self-adverts, `discover.neighbors` probes) had been going out at **904.6MHz/500kHz/SF8/CR5** this entire time, regardless of every container recreation with corrected `MESHCORE_LORA_*` env vars — none of those recreations ever touched the *persisted* prefs file, which is what actually wins. This alone could fully explain total silence, independent of the sync-word issue — a mismatched TX frequency means nobody would ever hear our probes, and we'd never see a direct reply even if our RX was otherwise perfectly configured.
+
+**Fix**: used MeshCore's own CLI (the officially correct way to change this — same thing a real user would do via the phone app's radio settings screen): `set radio 923.125,62.5,8,5` (confirmed via `get radio` immediately), then `reboot` (documented as required to apply — trivial for us since `LinuxBoard::reboot()` just does `exit(1)` and Docker's `restart: unless-stopped` brings the container back with freshly-loaded, now-correct persisted prefs). Verified post-reboot: `get radio` → `923.125,62.5,8,5`, confirmed applied.
+
+**Lesson for future container recreations**: `MESHCORE_LORA_*` env vars only set `PktFwdRadio`'s own internal defaults at `begin()` — they get **silently overridden** by whatever's in the persisted `/data` prefs shortly after, every single boot. The env vars only actually matter for a genuinely fresh `/data` volume with no prior prefs file. To change channel params on a node with existing persisted state, use the CLI's `set radio ...` + `reboot` instead — don't rely on just changing the env var and recreating the container.
+
+### Current full settings snapshot (2026-07-29, post-fix)
+| Setting | Value |
+|---|---|
+| `radio` (freq,bw,sf,cr) | `923.125,62.5,8,5` |
+| `tx` (power) | `20` dBm |
+| `name` | `MGE repeater` (set 2026-07-29, was the generic `repeater` default) |
+| `lat`/`lon` | `-27.5335`/`153.0750` (set 2026-07-29 — approximates the Hungry Jack's, 1329 Logan Rd, Mount Gravatt QLD 4122, used deliberately instead of the exact home address per the MBUG wiki's explicit privacy warning: MeshCore does not obfuscate location) |
+| `repeat` | `on` |
+| `path.hash.mode` | `0` |
+| `advert.interval` | `2` (minutes, zero-hop self-advert) |
+| `flood.advert.interval` | `47` (hours) |
+| `flood.max.advert` | `8` |
+| `role` | `repeater` |
+| `public.key` | `029AF8DDDAE28F42A349D91E33D9C04E911F1526843BE24DEF36A48C6545EE4B` |
+
+---
+
+## RF Reception Monitoring — methodology and runbook (2026-07-29)
+
+Written so this can be picked back up cleanly after physically relocating the device (better outdoor/height placement) without re-deriving the whole diagnostic approach from scratch.
+
+### The two signals, and why both matter
+
+There are two independent places to check for "did we receive anything," and they answer different questions:
+
+1. **MeshCore's own admin CLI** (`stats-packets` → `"recv"` field, also `neighbors`). This only increments for packets that (a) passed the concentrator's CRC check, (b) were forwarded upstream by `lora_pkt_fwd_1302` (`forward_crc_valid: true` in `gateway_conf`, the only forwarding path enabled), and (c) parsed successfully as a valid MeshCore packet. It's the "did we get a usable packet" signal.
+2. **`lora_pkt_fwd_1302`'s own raw stat report** — a `PUSH_DATA` JSON blob (`{"stat":{"rxnb":N,"rxok":N,"rxfw":N,...}}`) it emits every `stat_interval` seconds (30s in our config) over the loopback UDP socket to port 1680, *before* any CRC filtering. `rxnb` counts every frame where the demodulator locked onto our configured sync word + channel, **regardless of CRC outcome**. This is strictly more sensitive than (1) — it's the earliest point at which "something matching our exact RF fingerprint arrived" becomes visible, and it's Semtech's own most sensitive counter (confirmed against the official HAL header, `loragw_hal.h` — there is no lower-level continuous RSSI/energy API without the SX1261 spectral-scan chip, which this board does not have).
+
+**Rule of thumb: always check (2) first.** It caught real signal (`rxnb=2`) on 2026-07-28 23:08:07 GMT that (1) never saw, because both frames failed CRC and were correctly never forwarded.
+
+### On-demand manual check
+
+```bash
+KEY=~/.ssh/bobcat_lora_ed25519
+# MeshCore's own view (parsed, CRC-valid, forwarded packets only):
+ssh -i "$KEY" -o IdentitiesOnly=yes admin@192.168.4.17 '
+  PID=$(docker inspect --format "{{.State.Pid}}" meshcore-repeater 2>/dev/null)
+  printf "stats-packets\r\nneighbors\r\nstats-radio\r\n" > /proc/$PID/fd/0
+  sleep 1
+  docker logs meshcore-repeater 2>&1 | tail -6
+'
+
+# Raw concentrator view (any sync-word-matched frame, CRC pass or fail) — sniff one stat interval:
+ssh -i "$KEY" -o IdentitiesOnly=yes admin@192.168.4.17 '
+  timeout 35 tcpdump -i lo -n -A udp port 1680 2>/dev/null | grep -o "\"stat\":{[^}]*}"
+'
+```
+
+(`docker attach` hangs indefinitely over non-interactive SSH — always write commands directly to `/proc/$PID/fd/0` instead, per the earlier finding in this doc.)
+
+### Persistent background monitor (for unattended long-running checks)
+
+Running as a backgrounded loop (Claude Code `Monitor` tool, task would need re-creating in a fresh session — task IDs don't survive across sessions) that polls both signals every ~35s and only emits a notification when something changes from all-zero:
+
+```bash
+KEY=~/.ssh/bobcat_lora_ed25519
+ssh -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o BatchMode=yes -o ServerAliveInterval=30 admin@192.168.4.17 'bash -s' <<'REMOTE'
+cycle=0
+while true; do
+  cycle=$((cycle+1))
+  STAT=$(timeout 32 tcpdump -i lo -n -A udp port 1680 2>/dev/null | grep -o "\"stat\":{[^}]*}" | tail -1)
+  RXNB=$(echo "$STAT" | grep -o "\"rxnb\":[0-9]*" | cut -d: -f2)
+  RXFW=$(echo "$STAT" | grep -o "\"rxfw\":[0-9]*" | cut -d: -f2)
+  PID=$(docker inspect --format "{{.State.Pid}}" meshcore-repeater 2>/dev/null)
+  RECV=""
+  if [ -n "$PID" ]; then
+    printf "stats-packets\r\n" > /proc/$PID/fd/0 2>/dev/null
+    sleep 1
+    RECV=$(docker logs meshcore-repeater 2>&1 | tail -1 | grep -o "\"recv\":[0-9]*" | cut -d: -f2)
+  fi
+  [ -n "$RXNB" ] && [ "$RXNB" -gt 0 ] 2>/dev/null && echo "SIGNAL: concentrator RF detect rxnb=$RXNB rxfw=$RXFW recv=$RECV stat=$STAT"
+  [ -n "$RECV" ] && [ "$RECV" -gt 0 ] 2>/dev/null && echo "SIGNAL: meshcore recv=$RECV -- REAL PACKET RECEIVED"
+  [ $((cycle % 10)) -eq 0 ] && echo "heartbeat: cycle=$cycle rxnb=$RXNB rxfw=$RXFW recv=$RECV, no reception yet"
+done
+REMOTE
+```
+
+### The one real signal so far (2026-07-28 23:08:07 GMT)
+
+`{"rxnb":2,"rxok":0,"rxfw":0}` — two frames matched our exact sync word (private, 0x12) and channel (923.125MHz/62.5kHz/SF8) within one 30s window, both failed CRC. This is very likely a genuine MeshCore transmission from one of the two known nearby repeaters ("Morton", "BNE-RAK-Toohey" — see decoded map adverts above) arriving too weak/noisy to decode — i.e. **marginal link margin**, not a config or hardware-chain fault. Everything upstream of "does the signal physically arrive with enough SNR" has now been verified correct. This is the strongest evidence yet that the relocation (better outdoor/height placement) is the right next lever, not more config changes.
+
+### Diagnostic dead ends (don't re-attempt these without new information)
+
+- **`util_spectral_scan`** — needs the SX1261 companion radio from Semtech's official "Corecell" reference design. Confirmed absent on this board (no SX1261 strings anywhere in configs/binaries, only one `spidev` node). Not usable on this hardware.
+- **Raw/continuous RSSI independent of packet demodulation** — checked the full public `lgw_*` HAL API (`loragw_hal.h` on `Lora-net/sx1302_hal`). No such function exists; RSSI is only ever per-packet metadata from `lgw_receive()`, or from the (absent) SX1261 spectral scanner. This is a real hardware/API ceiling, not a missed tool.
+- **Cross-testing against the local Meshtastic network** — computed real AU915/ANZ LongFast parameters (919.875MHz, BW250kHz, SF11, CR4:5, default Frequency Slot 20, verified against `meshtastic/firmware`'s `RadioInterface.cpp` source directly) as a potential alternate RF source for diagnostics. Blocked: Meshtastic uses a hardcoded custom sync word (`0x2B`), and `lora_pkt_fwd_1302`'s config only exposes the standard binary `lorawan_public` toggle (0x34 public / 0x12 private) — no field for an arbitrary sync word. Would require patching `loragw_sx1302.c` and rebuilding the HAL/packet-forwarder from source to attempt. Not done.
+- **A broadband multi-SF sniff** (temporarily enabling `chan_multiSF_0-3` + `lorawan_public: true` to listen for *any* ambient LoRaWAN traffic, public sync word, ~±400kHz around 923.125MHz, SF5-12) was run for ~3 minutes on 2026-07-28 — zero detections. Procedure is reversible and documented in git history/conversation if it needs repeating; always restore from a fresh `global_conf_1302.json.meshcore-live-<timestamp>` backup afterward and confirm via `grep lorawan_public\|freq\|bandwidth\|spread_factor` before trusting the config again.
+
+### What "good" looks like after relocation
+
+Watch for `rxok` (not just `rxnb`) going non-zero on the raw stat, and/or MeshCore's own `recv` counter incrementing — that's a fully decoded packet, the actual goal. Given documented repeater advert intervals (zero-hop: 60-240 min, flood: 3-168 hrs, default ~3hrs), give any new placement **at least 4-6 hours** before treating continued silence as meaningful — shorter windows aren't long enough to rule out "just hasn't happened yet" per the network's own timing docs.
 
 ---
 
