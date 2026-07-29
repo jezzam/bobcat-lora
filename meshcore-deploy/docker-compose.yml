@@ -36,3 +36,8 @@ services:
       MESHCORE_LORA_BW: "62.5"
       MESHCORE_LORA_SF: "8"
       MESHCORE_LORA_CR: "5"
+      # Companion protocol (phone app) TCP listen port - reachable on the
+      # device's LAN IP for free via network_mode: host above, no port
+      # mapping needed. Same default the official app expects (matches
+      # SerialWifiInterface's TCP_PORT on ESP32 companion_radio boards).
+      MESHCORE_TCP_PORT: "5000"
