@@ -469,6 +469,50 @@ Goal: keep the device as a full, always-relaying repeater for the wider mesh, wh
 
 Also noted during this work: the stock Helium `miner` container (deliberately stopped early in this project) was found `Restarting (1)` at one point, crash-looping on `Error: Config(unsupported region: CUSTOMIZE)` — almost certainly reading the same UCI `radio_conf=customize` value set earlier for the packet-forwarder persistence fix and rejecting it as an invalid LoRaWAN region. No actual damage (config and repeater both confirmed intact); stopped again. Trigger unclear — device uptime showed no reboot around the time, so likely a `dockerd` restart not honoring the earlier manual stop, not something this project's changes caused directly.
 
+**Real end-to-end test done (2026-07-29)**: connected the official MeshCore iOS app to `<device-ip>:5000`. Connected cleanly, saw the existing node identity/name. Feature confirmed working.
+
+---
+
+## Miner container permanently disabled (2026-07-29)
+
+The stock Helium `miner` container kept coming back after being stopped/removed — root-caused to `/etc/init.d/miner.sh`, a SysV init script (triggered via `/etc/rcN.d/S##miner.sh` symlinks on boot) that runs `docker pull` + `docker run --name miner` unconditionally on every startup, independent of whatever state the container was left in. Removing the container/image alone doesn't stop this — the script just re-pulls and recreates it on the next boot.
+
+Fixed durably via `chmod -x /etc/init.d/miner.sh` (permissions now `-rw-------`) — this no-ops the script itself, which cleanly no-ops every symlink under `/etc/rc*.d/` that points at it, without needing to touch the symlinks individually. Verified clean across two real reboots (not just container restarts): no `miner` container recreated either time, `meshcore-repeater` and TCP:5000 came back up automatically both times via its own `restart: unless-stopped` policy, and identity/name/radio settings all persisted correctly.
+
+**Unresolved**: whether this (or the earlier miner image removal) affects the device's general firmware OTA update mechanism. `ota_daemon_new` was observed still running but never directly investigated — genuinely unknown, not just unlikely.
+
+---
+
+## Path hash size: switched repeater to 2-byte (2026-07-29)
+
+Per `wiki.mbug.com.au/en/Meshcore/path-hashsizes-and-regions` (MBUG, updated 2026-05-10): as the mesh grows, the historical 1-byte path hash (256 possible IDs, e.g. `be`) is starting to collide across repeaters — cited as a real, observed problem on the Eastmesh map, where messages get confused about routing because multiple repeaters (including across states) share the same 1-byte ID. Current recommendation: **repeaters move to 2-byte path hashes** (65,536 possible IDs); **companions stay on 1-byte for now**, for backward compat with repeaters still on older firmware.
+
+Confirmed via source that our build defaulted to 1-byte (`_prefs.path_hash_mode` is zeroed by the constructor's `memset(&_prefs, 0, ...)` and never explicitly set — `getPathHashSize() = path_hash_mode + 1`). The setting is already fully wired for us with zero code changes needed: `CMD_SET_PATH_HASH_MODE` (`examples/companion_radio/MyMesh.cpp:1454`) handles it over the binary companion protocol, so it was set live from the MeshCore app's repeater-admin tool now that TCP:5000 is connected. Note our custom plain-text SSH CLI (`handleCLICommand`) doesn't have an equivalent text command for this — only settable via the app for now.
+
+Path hash size for *relayed* (not self-originated) packets is dictated by the original sender's packet, not by the repeater's own prefs (`Mesh.cpp:335`, `self_id.copyHashTo(..., packet->getPathHashSize())` — matches whatever the packet already carries). The repeater's own `path_hash_mode` only affects packets it originates itself (self-adverts, CLI/chat replies).
+
+---
+
+## RF reception monitoring: `recv` counter was misleading, fixed to track real decodes (2026-07-30)
+
+The background RF monitor script (SSH loop polling the concentrator + `stats-packets` every ~32s cycle) was reporting `SIGNAL: meshcore recv=N -- REAL PACKET RECEIVED` on any increase in MeshCore's `recv` stat. Traced this through `variants/linux_udp_bridge/PktFwdRadio.cpp`: `recv` (`getPacketsRecv()`) increments in `recvRaw()` (line 167) every time a raw byte frame is dequeued and handed up to MeshCore's core stack — this only requires the `data` field of an incoming `rxpk` to base64-decode into *some* bytes (which nearly any garbage passes trivially), and happens **before** MeshCore's own packet-level parsing/validation. With `forward_crc_error`/`forward_crc_disabled` enabled (see RF Reception Monitoring section above), the packet forwarder forwards every `rxpk` regardless of the concentrator's own CRC-pass judgement, so `recv` was really just tracking "how many frames got forwarded," not "how many were genuine MeshCore packets."
+
+Confirmed directly: at a point where `recv:10`, the same `stats-packets` JSON showed `flood_rx:0,direct_rx:0` — the real decode-level counters (`getNumRecvFlood()`/`getNumRecvDirect()`, populated by MeshCore's Dispatcher only after a packet is actually validated/accepted) were still zero. So every `recv` increment logged up to that point was noise, not real reception — consistent with everything else already observed (mismatched `datr`/`codr` vs. our configured SF8/BW62.5/CR5, weak RSSI, simultaneous multi-channel detection suggesting concentrator front-end overload rather than a real single transmission).
+
+Fixed the monitor to track `flood_rx + direct_rx` deltas instead of `recv`, and to only fire on genuine increases in that combined "decoded" total (the original also had a related bug — `recv` never resets, so once nonzero it re-fired the same stale signal on every future poll; the new version now only signals on real forward progress).
+
+**First confirmed real reception (2026-07-30)**: shortly after physically relocating the device outside (still only ~3m up, not yet above rooflines), the fixed monitor logged `flood_rx=0 direct_rx=1` — the first genuine, MeshCore-Dispatcher-validated packet decode since this project began. A container restart (device power-cycled again mid-move) reset the stats counter shortly after, so this hasn't yet been followed up with sustained reception — pending further outdoor testing once the antenna is upgraded (see below).
+
+Also added `MESH_PACKET_LOGGING=1` to the CMakeLists compile definitions — an existing MeshCore build flag (not gated behind `#ifdef ARDUINO` the way `MESH_DEBUG_PRINTLN` is, so it actually takes effect on this Linux variant) that logs per-packet RX/TX detail (type/route/payload length/SNR/RSSI/hash) once a packet clears `Dispatcher::checkRecv()`'s format/checksum validation. Not yet rebuilt/deployed — queued for the next build alongside the antenna upgrade, to get real per-packet detail once reception is happening reliably rather than just the aggregate `flood_rx`/`direct_rx` counters.
+
+---
+
+## Antenna/RF hardware notes (2026-07-29/30, not yet acted on)
+
+- **Long coax cable question**: cable/feedline loss is reciprocal — the same dB loss applies to outbound TX and inbound RX equally. Raising TX power (already at 20dBm, `LORA_TX_POWER`) only compensates the outbound leg; it does nothing for RX sensitivity, which is the actual problem being chased here. What would help RX: a shorter/lower-loss cable run, an antenna-mounted LNA (amplifies before the cable loss is incurred), or better antenna placement/height — the device relocation above is pursuing the placement angle.
+- **Spare WiFi (2.4GHz) SMA antenna is not usable at 915MHz**: wavelength mismatch (2.4GHz ~12.5cm vs 915MHz ~32.8cm) means the antenna's internal elements aren't resonant at 915MHz — would present a bad impedance mismatch (high VSWR), degrading both TX (power reflected back rather than radiated) and RX (poor pickup of weak incoming signals) despite the SMA connector often physically fitting. Not worth trying even though one was on hand; a proper 915-928MHz-tuned antenna (even a basic ~8cm quarter-wave whip) would substantially outperform it.
+- Still outstanding: actually upgrading the antenna itself (current one is the stock Bobcat stub antenna, flagged by the user as plausibly low quality) — planned for after the outdoor-placement test.
+
 ---
 
 ## SSH / Root Access Research
